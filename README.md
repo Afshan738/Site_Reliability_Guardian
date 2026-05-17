@@ -29,6 +29,7 @@ POST /monitors
   "url": "https://example.com",
   "interval": 60
 }
+```
 Responsibility	Implementation
 Request validation	Express middleware
 Configuration persistence	PostgreSQL monitors table
