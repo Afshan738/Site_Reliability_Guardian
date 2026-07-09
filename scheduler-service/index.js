@@ -10,7 +10,13 @@ async function startScheduler() {
     );
 
     const channel = await connection.createChannel();
-    await channel.assertQueue("monitor_tasks", { durable: true });
+    await channel.assertQueue("monitor_tasks", {
+      durable: true,
+      arguments: {
+        "x-dead-letter-exchange": "",
+        "x-dead-letter-routing-key": "monitor_tasks_dead",
+      },
+    });
 
     console.log(" Scheduler is connected to RabbitMQ ....");
     setInterval(async () => {

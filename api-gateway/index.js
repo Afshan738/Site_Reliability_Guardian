@@ -12,7 +12,13 @@ async function connectRabbit() {
       process.env.RABBITMQ_URL || "amqp://localhost",
     );
     channel = await connection.createChannel();
-    await channel.assertQueue("monitor_tasks");
+    await channel.assertQueue("monitor_tasks", {
+      durable: true,
+      arguments: {
+        "x-dead-letter-exchange": "",
+        "x-dead-letter-routing-key": "monitor_tasks_dead",
+      },
+    });
     console.log("connected to rabbitMQ successfully");
   } catch (e) {
     console.error("rabbitMQ error:", e);

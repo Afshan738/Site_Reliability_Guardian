@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: "sentinel-worker"
+    static_configs:
+      - targets: ["192.168.10.4:8081"]

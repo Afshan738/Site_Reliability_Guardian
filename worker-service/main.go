@@ -7,18 +7,52 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-redis/redis/v8"
 	_ "github.com/lib/pq"
 	"github.com/streadway/amqp"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var ctx = context.Background()
 
+var (
+	pingsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sentinel_pings_total",
+			Help: "Total number of pings executed",
+		},
+		[]string{"status"},
+	)
+	pingLatency = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "sentinel_ping_latency_ms",
+			Help:    "Latency of pings in milliseconds",
+			Buckets: []float64{100, 250, 500, 1000, 2500, 5000},
+		},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(pingsTotal)
+	prometheus.MustRegister(pingLatency)
+}
+
 type MonitorTask struct {
 	ID  int    `json:"id"`
 	URL string `json:"url"`
+}
+
+type InternalResult struct {
+	MonitorID  int
+	StatusCode int
+	Latency    int
+	Status     string
+	Delivery   amqp.Delivery
 }
 
 func main() {
@@ -28,11 +62,6 @@ func main() {
 		log.Fatalf("Failed to connect to Postgres: %v", err)
 	}
 	defer db.Close()
-
-	err = db.Ping()
-	if err != nil {
-		log.Fatalf("Database is unreachable: %v", err)
-	}
 
 	amqpConn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
 	if err != nil {
@@ -47,116 +76,114 @@ func main() {
 	defer ch.Close()
 
 	_, err = ch.QueueDeclare("monitor_tasks_dead", true, false, false, false, nil)
-	if err != nil {
-		log.Fatalf("Failed to declare DLQ: %v", err)
-	}
-
 	args := amqp.Table{
 		"x-dead-letter-exchange":    "",
 		"x-dead-letter-routing-key": "monitor_tasks_dead",
 	}
 
 	q, err := ch.QueueDeclare("monitor_tasks", true, false, false, false, args)
-	if err != nil {
-		log.Fatalf("Failed to declare main queue: %v", err)
-	}
 
-	err = ch.Qos(1, 0, false)
-	if err != nil {
-		log.Fatalf("Failed to set QoS: %v", err)
-	}
+	err = ch.Qos(100, 0, false)
 
 	msgs, err := ch.Consume(q.Name, "", false, false, false, false, nil)
-	if err != nil {
-		log.Fatalf("Failed to register a consumer: %v", err)
-	}
 
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:16379",
-		Password: "",
-		DB:       0,
+		Addr: "localhost:16379",
 	})
 
-	err = rdb.Ping(ctx).Err()
-	if err != nil {
-		log.Fatalf("Failed to connect to Redis: %v", err)
-	}
-	log.Println("Connected to Redis successfully")
-	defer rdb.Close()
-
-	forever := make(chan bool)
+	resultsChan := make(chan InternalResult, 100)
 
 	go func() {
-		for d := range msgs {
-			var task MonitorTask
-			err := json.Unmarshal(d.Body, &task)
-			if err != nil {
-				log.Printf("Poison Message: %s", err)
-				d.Nack(false, false)
-				continue
-			}
+		var resultBuffer []InternalResult
+		batchSize := 10
 
-			var statusCode int
-			var statusText string
-			var latencyMs int
+		for res := range resultsChan {
+			resultBuffer = append(resultBuffer, res)
 
-			maxRetries := 3
-			success := false
+			if len(resultBuffer) >= batchSize {
+				valueStrings := make([]string, 0, len(resultBuffer))
+				valueArgs := make([]interface{}, 0, len(resultBuffer)*4)
 
-			for i := 0; i < maxRetries; i++ {
-				fmt.Printf("Worker Checking URL (Attempt %d): %s\n", i+1, task.URL)
-
-				start := time.Now()
-				client := http.Client{Timeout: 5 * time.Second}
-				resp, err := client.Get(task.URL)
-
-				if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 400 {
-					latencyMs = int(time.Since(start).Milliseconds())
-					statusCode = resp.StatusCode
-					statusText = "UP"
-					success = true
-					resp.Body.Close()
-					break
+				for i, r := range resultBuffer {
+					pos := i * 4
+					valueStrings = append(valueStrings, fmt.Sprintf("($%d, $%d, $%d, $%d)", pos+1, pos+2, pos+3, pos+4))
+					valueArgs = append(valueArgs, r.MonitorID, r.StatusCode, r.Latency, r.Status)
 				}
 
-				if i < maxRetries-1 {
-					waitTime := time.Duration(1<<(i+1)) * time.Second
-					fmt.Printf("Ping failed for %s. Retrying in %v...\n", task.URL, waitTime)
-					time.Sleep(waitTime)
+				bulkQuery := fmt.Sprintf("INSERT INTO checks (monitor_id, status_code, latency_ms, status_text) VALUES %s", strings.Join(valueStrings, ","))
+				_, err := db.Exec(bulkQuery, valueArgs...)
+
+				if err == nil {
+					for _, r := range resultBuffer {
+						r.Delivery.Ack(false)
+					}
+					log.Printf("Batch of %d saved to DB and ACKed", len(resultBuffer))
+				} else {
+					for _, r := range resultBuffer {
+						r.Delivery.Nack(false, true)
+					}
+					log.Printf("Batch failed, messages requeued: %v", err)
 				}
+				resultBuffer = nil
 			}
-
-			if !success {
-				statusCode = 0
-				statusText = "DOWN"
-				latencyMs = 0
-				log.Printf("Final result: %s is DOWN", task.URL)
-			} else {
-				log.Printf("Final result: %s is UP | Latency: %dms", task.URL, latencyMs)
-			}
-
-			checkQuery := `INSERT INTO checks (monitor_id, status_code, latency_ms, status_text) VALUES ($1, $2, $3, $4)`
-			_, err = db.Exec(checkQuery, task.ID, statusCode, latencyMs, statusText)
-			if err != nil {
-				log.Printf("Error saving check: %v", err)
-			}
-
-			updateQuery := `UPDATE monitors SET last_checked = NOW(), status = $1 WHERE id = $2`
-			_, err = db.Exec(updateQuery, statusText, task.ID)
-			if err != nil {
-				log.Printf("Error updating monitors table: %v", err)
-			}
-
-			redisKey := fmt.Sprintf("monitor:%d:status", task.ID)
-			err = rdb.Set(ctx, redisKey, statusText, 2*time.Hour).Err()
-			if err != nil {
-				log.Printf("Failed to cache status in Redis: %v", err)
-			}
-
-			d.Ack(false)
 		}
 	}()
 
-	log.Printf("Guardian Worker Online")
-	<-forever
+	go func() {
+		for d := range msgs {
+			go func(delivery amqp.Delivery) {
+				var task MonitorTask
+				if err := json.Unmarshal(delivery.Body, &task); err != nil {
+					delivery.Nack(false, false)
+					return
+				}
+
+				var statusCode int
+				var statusText string
+				var latencyMs int
+				success := false
+
+				for i := 0; i < 3; i++ {
+					start := time.Now()
+					client := http.Client{Timeout: 5 * time.Second}
+					resp, err := client.Get(task.URL)
+
+					if err == nil && resp.StatusCode < 400 {
+						latencyMs = int(time.Since(start).Milliseconds())
+						statusCode = resp.StatusCode
+						statusText = "UP"
+						success = true
+						resp.Body.Close()
+						break
+					}
+					time.Sleep(time.Duration(1<<(i+1)) * time.Second)
+				}
+
+				if !success {
+					statusText = "DOWN"
+				}
+
+				db.Exec(`UPDATE monitors SET last_checked = NOW(), status = $1 WHERE id = $2`, statusText, task.ID)
+				rdb.Set(ctx, fmt.Sprintf("monitor:%d:status", task.ID), statusText, 2*time.Hour)
+				pingsTotal.WithLabelValues(statusText).Inc()
+				pingLatency.Observe(float64(latencyMs))
+
+				resultsChan <- InternalResult{
+					MonitorID:  task.ID,
+					StatusCode: statusCode,
+					Latency:    latencyMs,
+					Status:     statusText,
+					Delivery:   delivery,
+				}
+			}(d)
+		}
+	}()
+
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		log.Fatal(http.ListenAndServe(":8081", nil))
+	}()
+
+	log.Printf("Guardian Worker Online | QoS: 100 | Mode: Concurrent")
+	select {}
 }
